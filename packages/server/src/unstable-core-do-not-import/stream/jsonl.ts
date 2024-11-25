@@ -118,6 +118,61 @@ class MaxDepthError extends Error {
     super('Max depth reached at path: ' + path.join('.'));
   }
 }
+function iteratorMergeResource<TYield, TReturn>() {
+  type PromiseResult = [
+    result: IteratorResult<TYield, TReturn>,
+    iterator: AsyncIterator<TYield, TReturn>,
+  ];
+  const iterators = new Map<
+    AsyncIterator<TYield, TReturn>,
+    Promise<PromiseResult>
+  >();
+  const nextPromises: Array<Promise<PromiseResult>> = [];
+
+  function enqueue(iterator: AsyncIterator<TYield, TReturn>) {
+    const promise = iterator
+      .next()
+      .then((result): PromiseResult => [result, iterator]);
+
+    nextPromises.push(promise);
+    iterators.set(iterator, promise);
+
+    promise.catch(() => {
+      // prevent unhandled promise rejection
+    });
+  }
+
+  return {
+    add(iterator: AsyncIterator<TYield, TReturn>) {
+      enqueue(iterator);
+    },
+    iterator: run(async function* () {
+      while (iterators.size) {
+        const [result, iterator] = await Unpromise.race(nextPromises);
+
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+        const promise = iterators.get(iterator)!;
+
+        // eslint-disable-next-line @typescript-eslint/no-floating-promises
+        nextPromises.splice(nextPromises.indexOf(promise), 1);
+
+        if (result.done) {
+          iterators.delete(iterator);
+        } else {
+          enqueue(iterator);
+        }
+
+        yield result.value;
+      }
+    }),
+
+    async [Symbol.asyncDispose]() {
+      await Promise.all(
+        Array.from(iterators).map(([iterator]) => iterator.return?.()),
+      );
+    },
+  };
+}
 
 async function* createBatchStreamProducer(
   opts: ProducerOptions,
@@ -126,10 +181,7 @@ async function* createBatchStreamProducer(
   let counter = 0 as ChunkIndex;
   const placeholder = 0 as PlaceholderValue;
 
-  const queue = new Set<{
-    iterator: AsyncIterator<ChunkData, ChunkData>;
-    nextPromise: Promise<IteratorResult<ChunkData, ChunkData>>;
-  }>();
+  await using iteratorMerge = iteratorMergeResource<ChunkData, ChunkData>();
   function registerAsync(
     callback: (idx: ChunkIndex) => AsyncIterable<ChunkData, ChunkData>,
   ) {
@@ -137,15 +189,7 @@ async function* createBatchStreamProducer(
 
     const iterator = callback(idx)[Symbol.asyncIterator]();
 
-    const nextPromise = iterator.next();
-
-    nextPromise.catch(() => {
-      // prevent unhandled promise rejection
-    });
-    queue.add({
-      iterator,
-      nextPromise,
-    });
+    iteratorMerge.add(iterator);
 
     return idx;
   }
@@ -188,6 +232,7 @@ async function* createBatchStreamProducer(
       try {
         while (true) {
           const next = await iterator.next();
+
           if (next.done) {
             return [
               idx,
@@ -258,38 +303,14 @@ async function* createBatchStreamProducer(
     return [[newObj], ...asyncValues];
   }
 
-  try {
-    const newHead: Head = {};
-    for (const [key, item] of Object.entries(data)) {
-      newHead[key] = encode(item, [key]);
-    }
-
-    yield newHead;
-
-    // Process all async iterables in parallel by racing their next values
-    while (queue.size > 0) {
-      // Race all iterators to get the next value from any of them
-      const [entry, res] = await Unpromise.race(
-        Array.from(queue).map(
-          async (it) => [it, await it.nextPromise] as const,
-        ),
-      );
-
-      yield res.value;
-
-      // Remove current iterator and re-add if not done
-      queue.delete(entry);
-      if (!res.done) {
-        entry.nextPromise = entry.iterator.next();
-        queue.add(entry);
-      }
-    }
-  } finally {
-    // Properly clean up any remaining iterators by calling return()
-    // Ensures resources are released if the loop exits early (e.g. due to error)
-    await Promise.all(Array.from(queue).map((it) => it.iterator.return?.()));
-    queue.clear();
+  const newHead: Head = {};
+  for (const [key, item] of Object.entries(data)) {
+    newHead[key] = encode(item, [key]);
   }
+
+  yield newHead;
+
+  yield* iteratorMerge.iterator;
 }
 /**
  * JSON Lines stream producer
