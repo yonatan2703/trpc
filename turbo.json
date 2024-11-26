@@ -23,7 +23,7 @@
     },
     "codegen-tests": {
       "outputs": ["server/__generated__/bigBoi/**"],
-      "dependsOn": ["//#codegen-tsconfigs", "codegen-entrypoints"]
+      "dependsOn": ["codegen-entrypoints"]
     },
     "prebuild": {
       "cache": false
